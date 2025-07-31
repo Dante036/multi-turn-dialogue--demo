@@ -1,8 +1,13 @@
 # 实战指南：使用 LangGraph 构建高可靠性的对话代理
 
-本指南将引导您完成构建一个高级对话代理的完整过程。该代理采用“管理者-工作者”架构，利用 LangGraph 的循环和状态管理能力来克服传统多轮对话中的“对话迷失”问题。
+本指南将引导您完成构建一个高级对话代理的完整过程。该代理采用**职责分离的“管理者-工作者”架构**，利用 LangGraph 的循环和状态管理能力来克服传统多轮对话中的“对话迷失”问题。
 
-最终，您将拥有一个能够智能提问、澄清需求、利用外部工具（如网络搜索），并在收集完所有必要信息后才执行核心任务的健壮代理。
+### 核心架构思想
+
+- **管理者 (Manager)**: 它的唯一职责是与用户进行对话，通过提问和澄清，将一个模糊的初始请求转化为一个**完整、无歧义的任务规范**。它**不持有**任何执行任务的工具（如网络搜索）。
+- **工作者 (Worker)**: 它接收由管理者提供的清晰任务规范，并利用其持有的**一系列工具**（如网络搜索、代码生成等）来自主完成任务。
+
+最终，您将拥有一个能够智能提问、澄清需求，并在完全理解用户意图后，才调用相应工具执行核心任务的健壮代理。
 
 ---
 
@@ -11,32 +16,31 @@
 首先，我们需要设置项目目录、Python 虚拟环境，并安装所有必需的库。
 
 1.  **安装依赖库**
-    我们将使用 LangChain、LangGraph、OpenAI 的模型以及 Tavily 进行网络搜索。
+    我们将使用 Poetry 管理依赖。核心库包括 LangChain、LangGraph、Qwen (通义千问) 的模型以及专用于工作者的 Tavily 搜索工具。
 
     ```bash
-    pip install -U langchain langgraph langchain-openai tavily-python python-dotenv
+    poetry add langchain langgraph langchain_community python-dotenv langchain-qianwen langchain-tavily
     ```
 
 2.  **设置环境变量**
-    在 `resilient_agent` 目录下创建一个名为 `.env` 的文件，并填入您的 API 密钥。这将使我们的代码能够安全地访问所需的服务。
+    在项目根目录下创建一个名为 `.env` 的文件，并填入您的 API 密钥。
 
     ```ini
     #.env 文件内容
-    OPENAI_API_KEY="sk-..."
+    DASHSCOPE_API_KEY="sk-..."
     TAVILY_API_KEY="tvly-..."
-    # (可选，但强烈推荐) 用于调试和可观测性
+    # (可选) 用于 LangSmith 调试
     LANGSMITH_API_KEY="ls__..."
     LANGCHAIN_TRACING_V2="true"
-    LANGCHAIN_PROJECT="Resilient Agent Tutorial"
     ```
 
 ---
 
 ## 第二步：定义代理的“中央记忆体”（State）
 
-LangGraph 的核心是 `State` 对象，它在整个工作流中被传递和修改。我们将定义一个全面的状态，以追踪对话的所有方面。
+LangGraph 的核心是 `State` 对象。我们的状态将保持不变，用于追踪整个对话和任务执行的流程。
 
-创建一个名为 `agent.py` 的文件，并添加以下代码：
+在 `agent.py` 文件中添加以下代码：
 
 ```python
 # agent.py
@@ -45,66 +49,32 @@ import operator
 from typing import TypedDict, Annotated, Any, List
 from langchain_core.messages import BaseMessage
 
-# 使用 TypedDict 定义一个全面的状态模式
 class AgentState(TypedDict):
-    """
-    代理状态的结构定义。
-
-    Attributes:
-        messages: 对话历史记录。
-        task_specification: 从用户对话中提取的结构化任务参数。
-        rephrased_query: 为 RAG 生成的独立查询。
-        execution_result: 最终任务的执行结果。
-    """
-    # `add_messages` 是一个特殊的函数，它将新消息附加到列表中，而不是覆盖它
     messages: Annotated[list, operator.add]
     task_specification: dict
-    rephrased_query: str
     execution_result: Any
 ```
 
 ---
 
-## 第三步：为“管理者”代理配备工具
+## 第三步：构建图的节点（代理的逻辑单元）
 
-“管理者”代理的目标是收集信息。我们将为其提供一个强大的网络搜索工具（Tavily），以便它可以在需要时从外部获取信息来帮助澄清用户需求。
+我们将定义两个核心的逻辑单元：管理者和工作者。
 
-在 `agent.py` 文件中继续添加：
+### 1. 管理者节点 (Manager)
 
-```python
-# agent.py (继续)
-
-from langchain_community.tools.tavily_search import TavilySearchResults
-
-# 初始化工具
-# 管理者代理将使用此工具来回答有关当前事件或它不知道的信息的问题。
-search_tool = TavilySearchResults(max_results=2)
-tools = [search_tool]
-```
-
----
-
-## 第四步：构建图的节点（代理的逻辑单元）
-
-现在，我们将定义代理工作流中的每个计算步骤。每个节点都是一个 Python 函数，它接收当前状态，执行操作，并返回对状态的更新。
+管理者的目标是**通过对话**形成清晰的任务规范。它不调用任何外部工具。
 
 在 `agent.py` 文件中继续添加：
 
 ```python
 # agent.py (继续)
 
-from langchain_openai import ChatOpenAI
+from langchain_qianwen import ChatTongyi
 from langchain_core.pydantic_v1 import BaseModel, Field
 
-# 初始化语言模型
-# 我们将使用一个支持工具调用的模型来驱动我们的代理
-model = ChatOpenAI(model="gpt-4o", temperature=0)
-
-# 将工具绑定到模型，这样模型就知道它有哪些可用的工具
-model_with_tools = model.bind_tools(tools)
-
-# 1. 管理者节点：更新任务规范
-# 这个节点是管理者的核心。它分析对话，并决定是需要澄清还是任务已准备好执行。
+# 初始化一个不带任何工具的纯对话模型，供管理者使用
+manager_llm = ChatTongyi(model="qwen-plus", temperature=0)
 
 class TaskSpecification(BaseModel):
     """用于定义最终任务的结构化规范。"""
@@ -116,41 +86,52 @@ class Clarification(BaseModel):
     question: str = Field(description="向用户提出的具体问题，以获取完成任务规范所需的缺失信息。")
 
 class ManagerTools(BaseModel):
-    """管理者可以使用的工具路由。"""
+    """管理者可以使用的“工具”，实际上是决策路由。"""
     task_spec: TaskSpecification
     clarification: Clarification
 
 def manager_node(state: AgentState):
     """
-    分析对话历史并决定下一步行动。
-    - 如果任务清晰，则填充 task_specification。
-    - 如果任务不清晰，则生成一个澄清问题。
+    分析对话历史，决定是继续提问还是任务已清晰。
     """
-    # 使用绑定了澄清和任务规范工具的模型
-    manager_model = model.with_structured_output(ManagerTools)
-    
+    # 将决策模型绑定到管理者的“工具”上
+    manager_model = manager_llm.with_structured_output(ManagerTools)
     response = manager_model.invoke(state['messages'])
     
     if isinstance(response, TaskSpecification):
-        # 任务已准备好，填充规范并准备移交给工作者
+        # 任务已清晰，填充规范并准备移交给工作者
         return {"task_specification": response.dict()}
     elif isinstance(response, Clarification):
-        # 需要更多信息，向用户提问
+        # 任务不清晰，向用户提问
         return {"messages": [("ai", response.question)]}
-    else:
-        # 备用逻辑
-        return {"messages": [("ai", "无法确定下一步。")]}
+    return {} # 默认无操作
+```
 
-# 2. 工作者节点：执行最终任务
-# 这个节点只有在任务规范完全确定后才会被调用。
+### 2. 工作者节点 (Worker)
 
+工作者接收明确的任务指示，并**使用其工具**来完成任务。
+
+在 `agent.py` 文件中继续添加：
+
+```python
+# agent.py (继续)
+from langchain_tavily import TavilySearchResults
+from langgraph.prebuilt import ToolNode
+
+# 1. 为工作者定义并初始化其专属工具
+search_tool = TavilySearchResults(max_results=2)
+worker_tools = [search_tool]
+
+# 2. 为工作者创建一个绑定了工具的语言模型
+worker_llm = ChatTongyi(model="qwen-plus", temperature=0)
+worker_llm_with_tools = worker_llm.bind_tools(worker_tools)
+
+# 3. 定义工作者节点
 def worker_node(state: AgentState):
     """
-    接收最终确定的任务规范并执行核心任务。
+    接收任务规范，并调用带有工具的模型来执行。
     """
     task_spec = state['task_specification']
-    
-    # 将规范格式化为一个清晰的提示
     worker_prompt = (
         f"请根据以下详细信息执行任务：
 "
@@ -159,55 +140,60 @@ def worker_node(state: AgentState):
         f"必须满足的要求: {', '.join(task_spec['requirements'])}"
     )
     
-    # 调用模型（可以绑定不同的工具）来执行任务
-    result = model_with_tools.invoke(worker_prompt)
+    # 工作者调用其带工具的模型
+    result = worker_llm_with_tools.invoke(worker_prompt)
     
+    # 如果模型决定调用工具，则将工具调用信息添加到消息历史中
+    if result.tool_calls:
+        return {"messages": [result]}
+    
+    # 如果模型直接返回结果，则任务完成
     return {"execution_result": result.content}
 
-# 3. 工具执行节点
-# 这是一个标准的 LangGraph 节点，用于执行模型请求的任何工具。
-from langgraph.prebuilt import ToolNode
-
-tool_node = ToolNode(tools)
+# 4. 定义一个标准的工具执行节点
+# 这个节点将由工作者在需要时调用
+tool_node = ToolNode(worker_tools)
 ```
 
 ---
 
-## 第五步：连接节点（定义控制流）
+## 第四步：连接节点（定义控制流）
 
-现在我们有了节点，需要用“边”将它们连接起来，告诉代理如何从一个步骤流向另一个步骤。我们将使用一个**条件边**来实现核心的循环逻辑。
+现在我们用“边”来定义代理的控制流，体现“管理者 -> 工作者 -> 工具”的清晰路径。
 
 在 `agent.py` 文件中继续添加：
 
 ```python
 # agent.py (继续)
 
-# 定义条件边
-# 这个函数决定是从管理者循环到工具，还是在规范完成后移交给工作者。
-
 def router(state: AgentState):
     """
-    根据管理者节点的输出决定下一个节点。
+    根据当前状态决定下一个节点。
     """
-    if "task_specification" in state and state["task_specification"]:
-        # 任务规范已填充，移交给工作者
-        return "worker"
-    else:
-        # 任务规范不完整，继续管理者循环（可能调用工具或再次提问）
-        last_message = state['messages'][-1]
-        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            return "tools"
-        else:
-            # 如果没有工具调用，并且规范不完整，则回到管理者进行下一次评估
-            return "manager"
-
+    # 如果任务规范尚未形成，则保持在管理者循环中
+    if not state.get("task_specification"):
+        return "manager"
+    
+    # 如果任务规范已形成，则检查上一条消息
+    last_message = state['messages'][-1]
+    
+    # 如果上一条消息是工具调用，则路由到工具节点
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        return "tools"
+    
+    # 如果任务已完成，则结束
+    if state.get("execution_result"):
+        return "END"
+        
+    # 否则，进入工作者节点执行任务
+    return "worker"
 ```
 
 ---
 
-## 第六步：组装并编译图
+## 第五步：组装并编译图
 
-最后一步是将我们定义的所有状态、节点和边组装成一个可执行的图。我们还将配置一个检查点（`checkpointer`）来自动保存对话历史，实现持久化记忆。
+最后一步是将所有部分组装成一个可执行的图。
 
 在 `agent.py` 文件中继续添加：
 
@@ -221,111 +207,75 @@ from langgraph.checkpoint.memory import MemorySaver
 workflow = StateGraph(AgentState)
 memory = MemorySaver()
 
-# 2. 添加节点到图中
+# 2. 添加节点
 workflow.add_node("manager", manager_node)
-workflow.add_node("tools", tool_node)
 workflow.add_node("worker", worker_node)
+workflow.add_node("tools", tool_node)
 
 # 3. 设置入口点
 workflow.set_entry_point("manager")
 
-# 4. 添加边
+# 4. 添加条件边
 workflow.add_conditional_edges(
     "manager",
-    router,
-    {"worker": "worker", "tools": "tools", "manager": "manager"}
+    # 管理者节点后的路由逻辑很简单：如果任务没定义好，就回到自己；否则交给工作者。
+    lambda x: "manager" if not x.get("task_specification") else "worker",
+    {"manager": "manager", "worker": "worker"}
 )
-workflow.add_edge("tools", "manager") # 工具执行后，返回管理者进行评估
-workflow.add_edge("worker", END) # 工作者执行完毕后，流程结束
+workflow.add_conditional_edges(
+    "worker",
+    # 工作者节点后的路由逻辑：检查是否有工具调用
+    lambda x: "tools" if x['messages'][-1].tool_calls else END,
+    {"tools": "tools", "END": END}
+)
+# 工具执行后，总是返回给工作者进行下一步评估
+workflow.add_edge("tools", "worker")
 
 # 5. 编译图
 app = workflow.compile(checkpointer=memory)
-
-# (可选) 可视化图
-# 这将生成一个显示代理流程的图像文件。
-try:
-    app.get_graph().draw_mermaid_png(output_file_path="graph.png")
-    print("代理架构图已保存为 graph.png")
-except Exception as e:
-    print(f"无法生成图表: {e}")
-
 ```
 
 ---
 
-## 第七步：运行和交互
+## 第六步：运行和交互
 
-现在，您的弹性对话代理已经准备就绪！以下是如何与它进行交互。创建一个名为 `main.py` 的新文件来运行代理。
-
-```python
-# main.py
-
-from agent import app
-import uuid
-
-# 为每个对话创建一个唯一的ID，以便内存可以被隔离
-thread_id = str(uuid.uuid4())
-config = {"configurable": {"thread_id": thread_id}}
-
-print("你好！我是一个高可靠性的对话代理。我们开始对话吧。（输入 '退出' 来结束）")
-
-while True:
-    user_input = input("你: ")
-    if user_input.lower() == "退出":
-        break
-    
-    # 将用户输入作为事件流式传输到应用中
-    events = app.stream(
-        {"messages": [("user", user_input)]}, config, stream_mode="values"
-    )
-    
-    for event in events:
-        if "messages" in event:
-            event["messages"][-1].pretty_print()
-        elif "execution_result" in event and event["execution_result"]:
-            print("
---- 最终结果 ---")
-            print(event["execution_result"])
-            print("--------------------")
-
-```
+交互代码 (`main.py`) 保持不变。
 
 **如何执行：**
 
 1.  确保您的 `.env` 文件已正确配置。
-
 2.  在终端中运行 `main.py`：
-
     ```bash
-    python main.py
+    poetry run python main.py
     ```
 
-**交互示例：**
+**新架构下的交互示例：**
 
-下面是一个演示代理如何工作的对话流程：
+对话的前半部分将完全相同，代理通过提问来澄清需求。关键区别在于**工具调用发生在工作者阶段**。
 
 ```
-你好！我是一个高可靠性的对话代理。我们开始对话吧。（输入 '退出' 来结束）
 你: 我需要写一个Python脚本。
 ================================ AI Message ================================
+
 当然，我很乐意帮助。这个Python脚本应该做什么？它有什么具体的要求吗？
-你: 它应该从一个网站上获取天气数据。
-================================ AI Message ================================
-好的，获取天气数据。您能告诉我应该从哪个具体的网站或API获取数据吗？另外，脚本需要处理哪些特定的城市？
+... (管理者持续提问，直到任务规范清晰) ...
 你: 就用Tavily搜索“旧金山天气”吧，然后把温度和天气状况打印出来。
-================================ AI Message ================================
+
+--- (此时，管理者完成任务，控制权交给工作者) ---
+--- (工作者接收到清晰指令，决定调用搜索工具) ---
 
 ================================= Tool Call ==================================
+
 tavily_search_results_json(query='旧金山天气')
 ================================== Tool Output =================================
-')]
+
+... (Tavily的搜索结果) ...
 ================================ AI Message ================================
 
+
 --- 最终结果 ---
-好的，这是一个Python脚本，它使用Tavily API搜索旧金山当前的天气，然后打印出温度和天气状况。
-... (此处为生成的代码)...
+好的，这是一个Python脚本... (工作者生成最终结果)
 --------------------
-你: 退出
 ```
 
-在这个例子中，代理通过一系列澄清问题（“管理者”循环），将一个模糊的初始请求（“写一个Python脚本”）逐步细化为一个完整、可执行的任务规范，最后才调用“工作者”来生成最终的代码。
+在这个新架构中，管理者的循环是纯粹的对话，而工作者的循环则包含了“思考 -> 调用工具 -> 观察结果”的执行链，职责划分更加清晰。
